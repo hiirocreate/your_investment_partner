@@ -15,7 +15,8 @@ data class WatchlistRow(
     val company: Company,
     val quote: StockQuote?,
     val latestNewsTitle: String?,
-    val hasNew: Boolean
+    val hasNew: Boolean,
+    val newsUnavailable: Boolean = false
 )
 
 data class WatchlistUiState(
@@ -35,13 +36,19 @@ class WatchlistViewModel(private val serviceLocator: ServiceLocator) : ViewModel
                 val rows = entities.mapNotNull { (entity, company) ->
                     if (company == null) return@mapNotNull null
                     val quote = serviceLocator.marketRepository.getQuote(company.companyId).getOrNull()
-                    val news = serviceLocator.newsRepository.getNewsForCompany(company.companyId, company.companyName)
-                        .maxByOrNull { it.source.publishedAtEpochMillis }
+                    // A single company's news source failing (offline, TDnet unavailable, etc.)
+                    // must not blank out the rest of the watchlist (spec section 41) - degrade
+                    // that one row to "news unavailable" instead of crashing/propagating.
+                    val newsResult = runCatching {
+                        serviceLocator.newsRepository.getNewsForCompany(company.companyId, company.companyName)
+                    }
+                    val news = newsResult.getOrNull()?.maxByOrNull { it.source.publishedAtEpochMillis }
                     WatchlistRow(
                         company = company,
                         quote = quote,
                         latestNewsTitle = news?.title,
-                        hasNew = news != null && System.currentTimeMillis() - news.source.publishedAtEpochMillis < 3 * 60 * 60 * 1000
+                        hasNew = news != null && System.currentTimeMillis() - news.source.publishedAtEpochMillis < 3 * 60 * 60 * 1000,
+                        newsUnavailable = newsResult.isFailure
                     )
                 }
                 _uiState.value = WatchlistUiState(isLoading = false, rows = rows)
