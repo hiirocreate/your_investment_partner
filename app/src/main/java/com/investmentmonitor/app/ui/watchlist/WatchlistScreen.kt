@@ -103,6 +103,12 @@ fun WatchlistScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1
                             )
+                        } else if (row.newsUnavailable) {
+                            Text(
+                                "ニュースを取得できませんでした",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
                         }
                     }
                 }
