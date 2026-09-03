@@ -24,6 +24,8 @@ class SettingsRepository(private val context: Context) {
         val NOTIFICATIONS_ENABLED = booleanPreferencesKey("notifications_enabled")
         val NOTIFICATION_LEVEL = stringPreferencesKey("notification_level")
         val WIFI_ONLY_UPDATES = booleanPreferencesKey("wifi_only_updates")
+        val JQUANTS_API_KEY = stringPreferencesKey("jquants_api_key")
+        val HOUJIN_BANGOU_APP_ID = stringPreferencesKey("houjin_bangou_app_id")
     }
 
     val onboardingDone: Flow<Boolean> =
@@ -63,5 +65,28 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setWifiOnlyUpdates(enabled: Boolean) {
         context.dataStore.edit { it[Keys.WIFI_ONLY_UPDATES] = enabled }
+    }
+
+    // --- Per-user API credentials (spec section 47: never hardcode/ship a shared key; each
+    // install stores only its own user's key locally, entered from the Settings screen) ---
+
+    /** J-Quants API key (V2: static "x-api-key", generated from the user's own J-Quants dashboard). */
+    val jquantsApiKey: Flow<String?> =
+        context.dataStore.data.map { it[Keys.JQUANTS_API_KEY]?.takeIf { key -> key.isNotBlank() } }
+
+    suspend fun setJquantsApiKey(value: String?) {
+        context.dataStore.edit {
+            if (value.isNullOrBlank()) it.remove(Keys.JQUANTS_API_KEY) else it[Keys.JQUANTS_API_KEY] = value
+        }
+    }
+
+    /** 国税庁 法人番号システムWeb-API アプリケーションID (free, per-user, applied for by email). */
+    val houjinBangouAppId: Flow<String?> =
+        context.dataStore.data.map { it[Keys.HOUJIN_BANGOU_APP_ID]?.takeIf { id -> id.isNotBlank() } }
+
+    suspend fun setHoujinBangouAppId(value: String?) {
+        context.dataStore.edit {
+            if (value.isNullOrBlank()) it.remove(Keys.HOUJIN_BANGOU_APP_ID) else it[Keys.HOUJIN_BANGOU_APP_ID] = value
+        }
     }
 }
