@@ -3,14 +3,13 @@ package com.investmentmonitor.app
 import android.content.Context
 import com.investmentmonitor.app.data.local.AppDatabase
 import com.investmentmonitor.app.data.local.SettingsRepository
+import com.investmentmonitor.app.data.provider.CompositeCorporateNumberProvider
+import com.investmentmonitor.app.data.provider.CompositeMarketDataProvider
 import com.investmentmonitor.app.data.provider.MockCompanyProvider
-import com.investmentmonitor.app.data.provider.MockCorporateNumberProvider
-import com.investmentmonitor.app.data.provider.MockMarketDataProvider
-import com.investmentmonitor.app.data.provider.MockNewsProvider
+import com.investmentmonitor.app.data.provider.TdnetNewsProvider
 import com.investmentmonitor.app.data.repository.CompanyRepository
 import com.investmentmonitor.app.data.repository.MarketRepository
 import com.investmentmonitor.app.data.repository.NewsRepository
-import kotlinx.coroutines.runBlocking
 
 /**
  * Deliberately simple, hand-rolled dependency container instead of a DI framework
@@ -26,17 +25,13 @@ class ServiceLocator(context: Context) {
     private val database by lazy { AppDatabase.getInstance(appContext) }
 
     private val companyProvider by lazy { MockCompanyProvider() }
-    private val corporateNumberProvider by lazy { MockCorporateNumberProvider() }
-    private val marketDataProvider by lazy { MockMarketDataProvider() }
-    private val newsProvider by lazy {
-        MockNewsProvider(watchedCompanyNames = {
-            runBlocking {
-                database.watchedCompanyDao().allIds().associateWith { id ->
-                    MockCompanyProvider.sampleCompanies.firstOrNull { it.companyId == id }?.companyName ?: id
-                }
-            }
-        })
-    }
+    // Stock prices (J-Quants) and corporate number lookup (国税庁法人番号Web-API) use whatever
+    // API credential the CURRENT user has entered in Settings - each install/user can supply
+    // their own account, nothing is baked into the build (spec section 47). Falls back to
+    // Mock automatically when no key is set, or the real call fails.
+    private val corporateNumberProvider by lazy { CompositeCorporateNumberProvider(settingsRepository) }
+    private val marketDataProvider by lazy { CompositeMarketDataProvider(settingsRepository) }
+    private val newsProvider by lazy { TdnetNewsProvider() }
 
     val companyRepository: CompanyRepository by lazy {
         CompanyRepository(companyProvider, database.watchedCompanyDao())
