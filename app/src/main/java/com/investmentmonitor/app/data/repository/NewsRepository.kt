@@ -6,11 +6,16 @@ import kotlin.math.abs
 
 class NewsRepository(private val newsProvider: NewsProvider) {
 
+    /**
+     * Note: these throw on a real provider failure (network error, API down, etc.) rather
+     * than silently returning an empty list - callers should catch and show a proper "could
+     * not update" state (spec section 40/41) instead of a misleading "no news" empty state.
+     */
     suspend fun getNewsForCompany(companyId: String, companyName: String): List<NewsItem> =
-        deduplicate(newsProvider.getNewsForCompany(companyId, companyName).getOrElse { emptyList() })
+        deduplicate(newsProvider.getNewsForCompany(companyId, companyName).getOrThrow())
 
     suspend fun getLatestNews(limit: Int = 50): List<NewsItem> =
-        deduplicate(newsProvider.getLatestNews(limit).getOrElse { emptyList() })
+        deduplicate(newsProvider.getLatestNews(limit).getOrThrow())
             .sortedByDescending { it.source.publishedAtEpochMillis }
 
     /**
