@@ -1,0 +1,136 @@
+name: Build APK
+
+on:
+  push:
+    branches-ignore: ["ci-status"]
+  pull_request:
+    branches-ignore: ["ci-status"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Run unit tests
+        id: unit_tests
+        run: ./gradlew test --stacktrace 2>&1 | tee build_test.log
+
+      - name: Build debug APK
+        id: build_debug
+        run: ./gradlew assembleDebug --stacktrace 2>&1 | tee build_debug.log
+
+      - name: Build release APK (unsigned unless signing secrets are configured)
+        id: build_release
+        run: ./gradlew assembleRelease --stacktrace 2>&1 | tee build_release.log
+        env:
+          RELEASE_STORE_FILE: ${{ secrets.RELEASE_STORE_FILE_PATH }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+      - name: Upload debug APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: ignore
+
+      - name: Upload release APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: ignore
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+
+      # Publishes a small machine-readable status file to a dedicated `ci-status` branch on
+      # every run (success or failure). This lets automated tooling check build health via
+      # plain `git fetch`/`git show` without needing GitHub REST API access.
+      - name: Publish CI status
+        if: always()
+        run: |
+          set +e
+          STATUS="success"
+          if [ "${{ steps.build_debug.outcome }}" != "success" ] || [ "${{ steps.build_release.outcome }}" != "success" ] || [ "${{ steps.unit_tests.outcome }}" != "success" ]; then
+            STATUS="failure"
+          fi
+
+          mkdir -p /tmp/ci-status
+          {
+            echo "# CI Status"
+            echo ""
+            echo "status: $STATUS"
+            echo "run_id: ${{ github.run_id }}"
+            echo "run_number: ${{ github.run_number }}"
+            echo "commit: ${{ github.sha }}"
+            echo "ref: ${{ github.ref }}"
+            echo "workflow_url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "timestamp_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "unit_tests: ${{ steps.unit_tests.outcome }}"
+            echo "build_debug: ${{ steps.build_debug.outcome }}"
+            echo "build_release: ${{ steps.build_release.outcome }}"
+            echo ""
+            echo "## Last log lines (debug build)"
+            echo '```'
+            tail -n 80 build_debug.log 2>/dev/null
+            echo '```'
+            echo ""
+            echo "## Last log lines (release build)"
+            echo '```'
+            tail -n 80 build_release.log 2>/dev/null
+            echo '```'
+          } > /tmp/ci-status/last-build.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin ci-status:ci-status 2>/dev/null || true
+          if git show-ref --verify --quiet refs/heads/ci-status; then
+            git checkout ci-status
+          else
+            git checkout --orphan ci-status
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          cp /tmp/ci-status/last-build.md ./last-build.md
+          git add last-build.md
+          git commit -m "ci: build $STATUS for ${{ github.sha }}" || echo "nothing to commit"
+          git push origin ci-status --force

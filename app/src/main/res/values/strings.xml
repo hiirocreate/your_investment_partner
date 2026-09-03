@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">投資情報モニター</string>
+    <string name="disclaimer_short">本アプリは投資助言サービスではありません。投資判断はご自身の責任で行ってください。</string>
+</resources>
