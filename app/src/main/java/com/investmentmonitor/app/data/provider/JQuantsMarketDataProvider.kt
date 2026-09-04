@@ -22,10 +22,12 @@ import java.util.TimeZone
  * J-Quants dashboard - no email/password ever passes through this app (spec section 47).
  * [apiKey] is supplied per-install from Settings (see SettingsRepository), never hardcoded.
  *
- * IMPORTANT: the J-Quants Free plan delivers data with roughly a 12-week delay. We are
- * honest about that rather than presenting old data as "now" (spec section 40): every quote
- * returned here has [StockQuote.isStale] = true and [StockQuote.asOfEpochMillis] set to the
- * actual trading date of the data, not the current time.
+ * IMPORTANT: the J-Quants Free plan delivers data with roughly a 12-week delay, while paid
+ * plans (Light/Standard/Premium) are updated same-day or near-real-time. We never assume which
+ * plan the user is on - instead we look at how old the latest bar we actually received is, and
+ * mark it stale only when it's genuinely old (spec section 40: never present old data as "now",
+ * but also never mislabel fresh paid-plan data as stale). [StockQuote.asOfEpochMillis] is always
+ * set to the actual trading date of the data, not the current time.
  */
 class JQuantsMarketDataProvider(private val apiKey: String) : MarketDataProvider {
 
@@ -41,6 +43,11 @@ class JQuantsMarketDataProvider(private val apiKey: String) : MarketDataProvider
             val latest = bars.last()
             val previous = if (bars.size >= 2) bars[bars.size - 2] else latest
 
+            // Don't hardcode "always stale" - Free plan data will genuinely be old, but paid
+            // plan data can be from today or yesterday. Judge staleness from how old the latest
+            // bar we actually received is, so paying users see accurate freshness too.
+            val isStale = (System.currentTimeMillis() - latest.timestampEpochMillis) > STALE_THRESHOLD_MILLIS
+
             Result.success(
                 StockQuote(
                     companyId = companyId,
@@ -51,7 +58,7 @@ class JQuantsMarketDataProvider(private val apiKey: String) : MarketDataProvider
                     dayLow = latest.low,
                     volume = latest.volume,
                     asOfEpochMillis = latest.timestampEpochMillis,
-                    isStale = true // Free plan is delayed - never claim this is "now"
+                    isStale = isStale
                 )
             )
         } catch (e: Exception) {
@@ -123,12 +130,10 @@ class JQuantsMarketDataProvider(private val apiKey: String) : MarketDataProvider
 
     companion object {
         private const val BASE_URL = "https://api.jquants.com"
+        // Latest bar within this window counts as "fresh" - covers weekends/holidays without
+        // false-flagging a paid-plan quote as stale just because markets were closed.
+        private const val STALE_THRESHOLD_MILLIS = 5L * 24 * 60 * 60 * 1000
 
-        private val DATE_FORMAT = object : ThreadLocal<SimpleDateFormat>() {
-            override fun initialValue(): SimpleDateFormat =
-                SimpleDateFormat("yyyy-MM-dd", Locale.JAPAN).apply {
-                    timeZone = TimeZone.getTimeZone("Asia/Tokyo")
-                }
-        }
+        private const val ago = ""
     }
 }
