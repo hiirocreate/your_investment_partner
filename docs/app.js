@@ -352,14 +352,37 @@ function estimateNewsImportance(title, category) {
   return "NORMAL";
 }
 const TdnetProvider = {
-  BASE_URL: "https://webapi.yanoshin.jp/webapi/tdnet/list",
-  async fetch(condition, limit, companyNameFallback) {
-    const url = `${this.BASE_URL}/${condition}.json?limit=${limit}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`TDnet API returned HTTP ${res.status}`);
+  // The TDnet API (webapi.yanoshin.jp) does not send an Access-Control-Allow-Origin header, so
+  // browsers block direct fetches to it from a page hosted on a different origin (CORS). There
+  // is no client-side workaround for that - the fix is server-side. A GitHub Actions workflow
+  // (.github/workflows/fetch-news.yml) fetches TDnet on a schedule from a GitHub-hosted runner
+  // (no CORS restriction there) and commits the result to this same-origin static file, which
+  // the browser can fetch freely. News here is therefore a periodic snapshot (refreshed roughly
+  // every 20 minutes), not literally live - fetchedAtEpochMillis() below is how callers show
+  // that honestly instead of implying it's real-time (spec section 40).
+  DATA_URL: "./data/news.json",
+  CACHE_TTL_MILLIS: 5 * 60 * 1000,
+  _cache: null,
+  _cacheAtMs: 0,
+  async loadData() {
+    const now = Date.now();
+    if (this._cache && (now - this._cacheAtMs) < this.CACHE_TTL_MILLIS) return this._cache;
+    const res = await fetch(this.DATA_URL, { cache: "no-store" });
+    if (!res.ok) throw new Error(`news.json returned HTTP ${res.status}`);
     const body = await res.json();
-    const items = Array.isArray(body.items) ? body.items : [];
-    return items.map(entry => this.toNewsItem(entry && entry.Tdnet, companyNameFallback)).filter(Boolean);
+    this._cache = body;
+    this._cacheAtMs = now;
+    return body;
+  },
+  fetchedAtEpochMillis() {
+    return this._cache ? this._cache.fetchedAtEpochMillis || null : null;
+  },
+  async fetch(condition, limit, companyNameFallback) {
+    const data = await this.loadData();
+    const items = condition === "recent"
+      ? (data.recent || [])
+      : ((data.byCompany && data.byCompany[condition]) || []);
+    return items.slice(0, limit).map(entry => this.toNewsItem(entry && entry.Tdnet, companyNameFallback)).filter(Boolean);
   },
   toNewsItem(tdnet, companyNameFallback) {
     if (!tdnet || !tdnet.title) return null;
@@ -604,9 +627,10 @@ async function renderHome(token) {
     const watchlist = Storage.getWatchlist().map(w => companyById(w.companyId)).filter(Boolean).slice(0, 5);
     const newsFailed = news === null;
 
-    let html = `<div class="section-header"><p style="margin-top:0">最終更新: ${relativeTimeLabel(Date.now())}</p></div>`;
+    const newsAt = TdnetProvider.fetchedAtEpochMillis();
+    let html = `<div class="section-header"><p style="margin-top:0">最終更新: ${relativeTimeLabel(newsAt || Date.now())}</p></div>`;
     if (newsFailed) {
-      html += `<div class="error-banner"><strong>ニュースを取得できませんでした</strong><span>ネットワーク接続、またはブラウザの制限(CORS)により取得できなかった可能性があります。</span></div>`;
+      html += `<div class="error-banner"><strong>ニュースを取得できませんでした</strong><span>ニュースデータの読み込みに失敗しました。しばらくしてページを再読み込みしてください。</span></div>`;
     }
     html += `<div class="section-header"><h2>重要ニュース</h2><p>今日、注目すべき動き</p></div>`;
     html += (!news || news.length === 0) ? `<div class="empty-state">${newsFailed ? "" : "まだニュースがありません。企業を登録すると表示されます。"}</div>`
@@ -770,7 +794,7 @@ function renderCompanyDetailBody(company, quote, history_, news, relations) {
     ${relations.length > 0 ? `<div class="section-header"><h2>関連企業</h2></div><div class="card">${relations.map(r => `<div>・${escapeHtml(r.toCompany.companyName)}(${escapeHtml(RELATION_LABELS[r.relationType] || r.relationType)})</div>`).join("")}</div>` : ""}
     <button class="btn-outline" id="watchToggleBtn" style="margin:12px 16px">${isWatched ? "★ 監視中(タップで解除)" : "☆ この企業を監視する"}</button>
     <div class="section-header"><h2>ニュース</h2></div>
-    ${news === null ? `<div class="error-banner"><strong>ニュースを取得できませんでした</strong><span>ネットワーク接続、またはブラウザの制限(CORS)の可能性があります。</span></div>`
+    ${news === null ? `<div class="error-banner"><strong>ニュースを取得できませんでした</strong><span>ニュースデータの読み込みに失敗しました。しばらくしてページを再読み込みしてください。</span></div>`
       : news.length === 0 ? `<div class="empty-state">この企業に関するニュースはまだありません。</div>`
       : news.sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis).map(newsItemHtml).join("")}
     ${disclaimerHtml()}`;
@@ -876,7 +900,9 @@ async function renderNews(token) {
   renderNewsBody(news);
 }
 function renderNewsBody(allNews) {
-  let html = `<div class="chip-row" id="newsCatChips">
+  const newsAt = TdnetProvider.fetchedAtEpochMillis();
+  let html = `<p class="freshness" style="padding:0 16px">${newsAt ? `ニュース最終更新: ${relativeTimeLabel(newsAt)}(約20分ごとに自動更新)` : ""}</p>
+    <div class="chip-row" id="newsCatChips">
       <button class="chip ${selectedNewsCategory === null ? "selected" : ""}" data-cat="">すべて</button>
       ${Object.keys(NEWS_CATEGORY_LABELS).map(cat => `<button class="chip ${cat === selectedNewsCategory ? "selected" : ""}" data-cat="${cat}">${NEWS_CATEGORY_LABELS[cat]}</button>`).join("")}
     </div>
@@ -885,7 +911,7 @@ function renderNewsBody(allNews) {
       <button class="chip ${selectedNewsSort === "IMPORTANCE" ? "selected" : ""}" data-sort="IMPORTANCE">重要度順</button>
     </div>`;
   if (allNews === null) {
-    html += `<div class="error-banner"><strong>ニュースを取得できませんでした。</strong><span>ネットワーク接続、またはブラウザの制限(CORS)の可能性があります。</span></div>`;
+    html += `<div class="error-banner"><strong>ニュースを取得できませんでした。</strong><span>ニュースデータの読み込みに失敗しました。しばらくしてページを再読み込みしてください。</span></div>`;
   } else {
     let filtered = selectedNewsCategory ? allNews.filter(n => n.category === selectedNewsCategory) : allNews.slice();
     filtered = selectedNewsSort === "NEWEST"
