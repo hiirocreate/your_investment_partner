@@ -51,7 +51,10 @@ jobs:
           data = {"fetchedAtEpochMillis": int(time.time() * 1000), "recent": [], "byCompany": {}}
 
           try:
-              data["recent"] = fetch("recent", 50)
+              # 150, not 50: the app's news tab requests up to 100 items from this list, and the
+              # "recent" feed spans all ~4,000 TSE-listed companies (not just the 10 tracked ones),
+              # so a shallow fetch would mostly miss the tracked companies' own news entirely.
+              data["recent"] = fetch("recent", 150)
           except Exception as e:
               print(f"WARN: recent news fetch failed: {e}")
 
