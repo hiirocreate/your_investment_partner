@@ -134,6 +134,11 @@ class JQuantsMarketDataProvider(private val apiKey: String) : MarketDataProvider
         // false-flagging a paid-plan quote as stale just because markets were closed.
         private const val STALE_THRESHOLD_MILLIS = 5L * 24 * 60 * 60 * 1000
 
-        private const val ago = ""
+        private val DATE_FORMAT = object : ThreadLocal<SimpleDateFormat>() {
+            override fun initialValue(): SimpleDateFormat =
+                SimpleDateFormat("yyyy-MM-dd", Locale.JAPAN).apply {
+                    timeZone = TimeZone.getTimeZone("Asia/Tokyo")
+                }
+        }
     }
 }
