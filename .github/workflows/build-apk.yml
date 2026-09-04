@@ -48,17 +48,17 @@ jobs:
         id: build_debug
         run: set -o pipefail; ./gradlew assembleDebug --stacktrace 2>&1 | tee build_debug.log
 
-      # The keystore itself is never committed to the repo - it only ever exists as a base64
-      # secret (RELEASE_KEYSTORE_BASE64) that gets decoded back into a real .jks file here, in
-      # the throwaway CI runner, right before the signed build. If that secret isn't set yet,
-      # this step does nothing and RELEASE_STORE_FILE stays unset, so the release build below
-      # correctly falls back to unsigned (spec section 6/47).
       - name: Decode release keystore (skipped if signing secrets aren't configured yet)
         run: |
           if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
             mkdir -p app/keystore
             echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > app/keystore/release.keystore.jks
-            echo "RELEASE_STORE_FILE=app/keystore/release.keystore.jks" >> "$GITHUB_ENV"
+            # Use an ABSOLUTE path here. build.gradle.kts calls file(RELEASE_STORE_FILE) from
+            # inside the app/ module script, so a relative "app/keystore/..." gets resolved
+            # *again* relative to app/, landing on app/app/keystore/... (confirmed: that's
+            # exactly the doubled path GitHub Actions run #27 failed on). An absolute path
+            # sidesteps that ambiguity entirely.
+            echo "RELEASE_STORE_FILE=$GITHUB_WORKSPACE/app/keystore/release.keystore.jks" >> "$GITHUB_ENV"
           fi
 
       - name: Build release APK (unsigned unless signing secrets are configured)
@@ -69,8 +69,6 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
 
-      # Pure visibility - shows up directly in this step's log regardless of what happened above,
-      # without needing to dig through the full Gradle output.
       - name: Show release APK output directory
         if: always()
         run: |
@@ -101,9 +99,6 @@ jobs:
           path: app/build/reports/tests/
           if-no-files-found: ignore
 
-      # Publishes a small machine-readable status file to a dedicated `ci-status` branch on
-      # every run (success or failure). This lets automated tooling check build health via
-      # plain `git fetch`/`git show` without needing GitHub REST API access.
       - name: Publish CI status
         if: always()
         run: |
@@ -138,9 +133,6 @@ jobs:
             tail -n 80 build_release.log 2>/dev/null
             echo '```'
             echo ""
-            # Gradle's actual "what went wrong" summary can be well before the last 80 lines when
-            # --stacktrace prints a long exception first - grab from that summary onward instead
-            # of just the raw tail, so the real error message is never lost off the end.
             echo "## Release build failure summary (if any)"
             echo '```'
             awk '/FAILURE: Build failed|^\* What went wrong:/{found=1} found' build_release.log 2>/dev/null | head -n 100
