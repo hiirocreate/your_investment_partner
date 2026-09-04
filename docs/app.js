@@ -423,21 +423,14 @@ const NewsRepository = {
     return this.deduplicate(items);
   },
   async getLatestNews(limit) {
-    // Deliberately NOT the "recent" TDnet feed (news about any of the ~4,000 companies listed on
-    // TSE) - a news item's companyId always comes from TDnet's own data, so a "recent" item is
-    // very often about a company outside this app's fixed sample roster. Tapping it would try to
-    // open a company detail page this app has no data for ("企業情報が見つかりません" - a real bug
-    // reported after the CORS fix started showing genuine TDnet news here). Restricting to news
-    // about the companies this app actually knows about keeps every news item tappable.
-    const perCompany = await Promise.all(
-      SAMPLE_COMPANIES
-        .filter(c => c.companyId !== "IPO001") // fictional demo company - no real TDnet data
-        .map(c => TdnetProvider.fetch(c.companyId, limit, c.companyName))
-    );
-    const items = perCompany.flat();
-    return this.deduplicate(items)
-      .sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis)
-      .slice(0, limit);
+    // The full market-wide "recent" TDnet feed (news about any of the ~4,000 companies listed on
+    // TSE), not narrowed to this app's 10 tracked sample companies - users want to see notable
+    // market news broadly, not only about the companies they happen to be watching. Tapping a
+    // news item about a company outside the tracked roster now opens a lightweight fallback
+    // detail view (see renderUntrackedCompanyDetail in the UI section) instead of the old hard
+    // "企業情報が見つかりません" error, so broader coverage no longer means dead-end taps.
+    const items = await TdnetProvider.fetch("recent", limit, null);
+    return this.deduplicate(items).sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis);
   },
   deduplicate(items) {
     const sorted = [...items].sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis);
@@ -631,6 +624,7 @@ function newsItemHtml(news) {
       <span>${escapeHtml(news.source.sourceName)}</span>
       <span>${relativeTimeLabel(news.source.publishedAtEpochMillis)}</span>
       ${news.relatedCount > 0 ? `<span class="related">関連ニュース ${news.relatedCount}件</span>` : ""}
+      ${news.source.sourceUrl ? `<a href="${escapeHtml(news.source.sourceUrl)}" target="_blank" rel="noopener" class="related" onclick="event.stopPropagation()">原文(PDF) →</a>` : ""}
     </div>
   </div>`;
 }
@@ -782,10 +776,19 @@ async function renderSearch() {
 let selectedChartRange = "M1";
 async function renderCompanyDetail(companyId, token) {
   const company = companyById(companyId);
-  if (!company) { screenEl.innerHTML = `<div class="empty-state">企業情報が見つかりません。</div>`; return; }
-  topbarTitle.textContent = company.companyName;
   screenEl.innerHTML = loadingHtml();
   selectedChartRange = "M1";
+
+  // The news feed is now market-wide (all ~4,000 TSE-listed companies), but this app only holds
+  // full profile data (financials, chart, related companies) for its 10 tracked sample companies.
+  // Rather than a dead-end "企業情報が見つかりません" for everything else, fall back to a lighter
+  // view built from what's actually available for any real stock code: a live/mock quote and
+  // whatever TDnet news mentions it (spec section 40 - never fake a fuller profile than we have).
+  if (!company) {
+    await renderUntrackedCompanyDetail(companyId, token);
+    return;
+  }
+  topbarTitle.textContent = company.companyName;
 
   const [quote, history_, news, relations] = await Promise.all([
     MarketRepository.getQuote(companyId).then(withChange).catch(() => null),
@@ -795,6 +798,37 @@ async function renderCompanyDetail(companyId, token) {
   ]);
   if (token !== currentAbortToken) return;
   renderCompanyDetailBody(company, quote, history_, news, relations);
+}
+async function renderUntrackedCompanyDetail(companyId, token) {
+  const [quote, data] = await Promise.all([
+    MarketRepository.getQuote(companyId).then(withChange).catch(() => null),
+    TdnetProvider.loadData().catch(() => null)
+  ]);
+  if (token !== currentAbortToken) return;
+  // Recover the company name and any mentions of it from the already-loaded "recent" feed
+  // (this is how the user found their way here in the first place - a tap from a news card).
+  const fromRecent = data ? (data.recent || [])
+    .map(entry => TdnetProvider.toNewsItem(entry && entry.Tdnet, null))
+    .filter(n => n && n.companyId === companyId) : [];
+  const news = NewsRepository.deduplicate(fromRecent)
+    .sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis);
+  const companyName = news[0]?.companyName || companyId;
+  topbarTitle.textContent = companyName;
+
+  const html = `<div class="quote-row">
+      ${quote ? `<div><div class="quote-price">¥${formatYen(quote.price)}</div>${freshnessHtml(quote.asOfEpochMillis, quote.isStale)}</div>${changeBadgeHtml(quote.change, quote.changePercent)}`
+              : `<div class="freshness">株価データを取得できませんでした</div>`}
+    </div>
+    <div class="card">
+      <div class="card-title" style="margin-bottom:8px">${escapeHtml(companyName)}</div>
+      <div class="info-row"><span class="label">証券コード</span><span class="value">${escapeHtml(companyId)}</span></div>
+      <div class="empty-state" style="padding:10px 0 0;text-align:left">この企業は監視対象リスト(10社)に含まれていないため、詳細な財務情報(PER・PBR等)や関連企業は表示できません。ニュース原文は下のリンクからご確認いただけます。</div>
+    </div>
+    <div class="section-header"><h2>ニュース</h2></div>
+    ${news.length === 0 ? `<div class="empty-state">この企業のニュースが見つかりませんでした。</div>` : news.map(newsItemHtml).join("")}
+    ${disclaimerHtml()}`;
+  screenEl.innerHTML = html;
+  bindNav(screenEl);
 }
 function renderCompanyDetailBody(company, quote, history_, news, relations) {
   const isWatched = Storage.isWatched(company.companyId);
