@@ -364,15 +364,27 @@ const TdnetProvider = {
   CACHE_TTL_MILLIS: 5 * 60 * 1000,
   _cache: null,
   _cacheAtMs: 0,
+  _pending: null,
   async loadData() {
     const now = Date.now();
     if (this._cache && (now - this._cacheAtMs) < this.CACHE_TTL_MILLIS) return this._cache;
-    const res = await fetch(this.DATA_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`news.json returned HTTP ${res.status}`);
-    const body = await res.json();
-    this._cache = body;
-    this._cacheAtMs = now;
-    return body;
+    // getLatestNews() below fires several fetch() calls (one per tracked company) at once on a
+    // cold cache - without this, each would race to fetch the same file separately instead of
+    // sharing one in-flight request.
+    if (this._pending) return this._pending;
+    this._pending = (async () => {
+      try {
+        const res = await fetch(this.DATA_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error(`news.json returned HTTP ${res.status}`);
+        const body = await res.json();
+        this._cache = body;
+        this._cacheAtMs = Date.now();
+        return body;
+      } finally {
+        this._pending = null;
+      }
+    })();
+    return this._pending;
   },
   fetchedAtEpochMillis() {
     return this._cache ? this._cache.fetchedAtEpochMillis || null : null;
@@ -411,8 +423,21 @@ const NewsRepository = {
     return this.deduplicate(items);
   },
   async getLatestNews(limit) {
-    const items = await TdnetProvider.fetch("recent", limit, null);
-    return this.deduplicate(items).sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis);
+    // Deliberately NOT the "recent" TDnet feed (news about any of the ~4,000 companies listed on
+    // TSE) - a news item's companyId always comes from TDnet's own data, so a "recent" item is
+    // very often about a company outside this app's fixed sample roster. Tapping it would try to
+    // open a company detail page this app has no data for ("企業情報が見つかりません" - a real bug
+    // reported after the CORS fix started showing genuine TDnet news here). Restricting to news
+    // about the companies this app actually knows about keeps every news item tappable.
+    const perCompany = await Promise.all(
+      SAMPLE_COMPANIES
+        .filter(c => c.companyId !== "IPO001") // fictional demo company - no real TDnet data
+        .map(c => TdnetProvider.fetch(c.companyId, limit, c.companyName))
+    );
+    const items = perCompany.flat();
+    return this.deduplicate(items)
+      .sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis)
+      .slice(0, limit);
   },
   deduplicate(items) {
     const sorted = [...items].sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis);
