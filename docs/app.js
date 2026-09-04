@@ -168,11 +168,20 @@ const CompanyProvider = {
     await sleep(150);
     const q = query.trim();
     if (!q) return [];
-    return SAMPLE_COMPANIES.filter(c =>
+    const sampleMatches = SAMPLE_COMPANIES.filter(c =>
       c.companyName.includes(q) || c.officialName.includes(q) ||
       (c.stockCode && c.stockCode.includes(q)) ||
       (READING_INDEX[c.companyId] || []).some(alias => alias.toLowerCase().includes(q.toLowerCase()))
     );
+    // 監視対象10社(詳細プロフィールあり)に加えて、東証の全上場銘柄(companies.json、簡易プロフィール)
+    // からも検索する。「株の購入ができる企業を全て見れるようにしたい」という要望への対応。
+    const masterMatches = await CompanyMasterProvider.search(q, 40).catch(() => []);
+    const seen = new Set(sampleMatches.map(c => c.companyId));
+    const merged = sampleMatches.slice();
+    for (const c of masterMatches) {
+      if (!seen.has(c.companyId)) { merged.push(c); seen.add(c.companyId); }
+    }
+    return merged.slice(0, 50);
   },
   async getCompany(companyId) { return companyById(companyId); },
   async getRelatedCompanies(companyId) { return RELATIONS_INDEX[companyId] || []; }
@@ -221,64 +230,148 @@ const MockMarketDataProvider = {
   }
 };
 
-const JQuantsProvider = {
-  async fetchBars(companyId, fromMs, toMs, apiKey) {
-    const fmt = d => new Date(d).toISOString().slice(0, 10);
-    const url = `https://api.jquants.com/v2/equities/bars/daily?code=${encodeURIComponent(companyId)}&from=${fmt(fromMs)}&to=${fmt(toMs)}`;
-    const res = await fetch(url, { headers: { "x-api-key": apiKey } });
-    if (!res.ok) throw new Error(`J-Quants API returned HTTP ${res.status}`);
-    const body = await res.json();
-    const rows = Array.isArray(body.data) ? body.data : [];
-    const points = rows.map(bar => {
-      const dateStr = bar.Date; if (!dateStr) return null;
-      const ts = Date.parse(dateStr); if (Number.isNaN(ts)) return null;
-      const open = bar.AdjO ?? bar.O, high = bar.AdjH ?? bar.H, low = bar.AdjL ?? bar.L, close = bar.AdjC ?? bar.C;
-      if ([open, high, low, close].some(v => v == null || Number.isNaN(v))) return null;
-      return { timestampEpochMillis: ts, open, high, low, close, volume: Math.round(bar.AdjVo ?? bar.Vo ?? 0) };
-    }).filter(Boolean).sort((a, b) => a.timestampEpochMillis - b.timestampEpochMillis);
-    return points;
+// J-Quants (api.jquants.com) does not send CORS headers, so a browser calling it directly from
+// a page hosted on a different origin is always blocked - confirmed by live testing (the same
+// way the TDnet CORS block was confirmed), not guessed. There is no client-side workaround, so
+// real market data can no longer be fetched with a personally-registered browser-stored key
+// (that field has been removed from Settings). Instead, .github/workflows/fetch-market-data.yml
+// fetches it server-side (using JQUANTS_API_KEY, a GitHub Secret) on a daily schedule and
+// commits it to these same-origin static files, which QuoteSnapshotProvider/CompanyMasterProvider
+// below read - the same pattern already used for TDnet news.
+const QuoteSnapshotProvider = {
+  DATA_URL: "./data/quotes.json",
+  CACHE_TTL_MILLIS: 10 * 60 * 1000,
+  // 無料プランのデータは常に約12週間遅れなので、常に「最新ではない」という正直な表示にする
+  // (更新に失敗しているのではなく、プランの仕様上そもそも最新ではないため)。
+  STALE_THRESHOLD_MILLIS: 10 * 24 * 60 * 60 * 1000,
+  _cache: null,
+  _cacheAtMs: 0,
+  _pending: null,
+  async loadData() {
+    const now = Date.now();
+    if (this._cache && (now - this._cacheAtMs) < this.CACHE_TTL_MILLIS) return this._cache;
+    if (this._pending) return this._pending;
+    this._pending = (async () => {
+      try {
+        const res = await fetch(this.DATA_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error(`quotes.json returned HTTP ${res.status}`);
+        const body = await res.json();
+        this._cache = body;
+        this._cacheAtMs = Date.now();
+        return body;
+      } finally {
+        this._pending = null;
+      }
+    })();
+    return this._pending;
   },
-  async getQuote(companyId, apiKey) {
-    const to = Date.now(), from = to - 21 * 86400e3;
-    const bars = await this.fetchBars(companyId, from, to, apiKey);
-    if (bars.length < 1) throw new Error(`No J-Quants data returned for ${companyId}`);
-    const latest = bars[bars.length - 1];
-    const previous = bars.length >= 2 ? bars[bars.length - 2] : latest;
-    // 無料プランは大きく遅延するが、上位プランは大引け直後には当日分が更新される。
-    // 「常に古いデータ扱い」にはせず、取得できた最新データが何営業日前かで自動判定する
-    // (無料プラン・有料プランのどちらでも正直な表示になるようにするため)。
-    const staleThresholdMs = 5 * 86400e3; // 直近5日以内のデータなら「最新」とみなす
-    const isStale = (Date.now() - latest.timestampEpochMillis) > staleThresholdMs;
+  async getQuote(companyId) {
+    const data = await this.loadData();
+    const q = data && data.quotes ? data.quotes[companyId] : null;
+    if (!q || q.close == null) return null;
+    const asOfEpochMillis = Date.parse(`${q.date}T15:00:00+09:00`); // 大引け時刻を基準時刻とする
+    const asOf = Number.isNaN(asOfEpochMillis) ? Date.now() : asOfEpochMillis;
+    // 前日終値が取得できなかった銘柄は騰落率を計算できないため、変化なし(0%)として安全側に倒す
+    const previousClose = q.prevClose != null ? q.prevClose : q.close;
     return {
-      companyId, price: latest.close, previousClose: previous.close, open: latest.open,
-      dayHigh: latest.high, dayLow: latest.low, volume: latest.volume,
-      asOfEpochMillis: latest.timestampEpochMillis, isStale
+      companyId, price: q.close, previousClose, open: q.open,
+      dayHigh: q.high, dayLow: q.low, volume: q.volume,
+      asOfEpochMillis: asOf, isStale: (Date.now() - asOf) > this.STALE_THRESHOLD_MILLIS
     };
-  },
-  async getHistory(companyId, rangeKey, apiKey) {
-    const range = CHART_RANGES.find(r => r.key === rangeKey) || CHART_RANGES[2];
-    const to = Date.now(), from = to - range.days * 86400e3;
-    return this.fetchBars(companyId, from, to, apiKey);
   }
 };
 
+function mapMarketToExchangeKey(marketName) {
+  if (!marketName) return "UNKNOWN";
+  if (marketName.includes("プライム")) return "TSE_PRIME";
+  if (marketName.includes("スタンダード")) return "TSE_STANDARD";
+  if (marketName.includes("グロース")) return "TSE_GROWTH";
+  return "OTHER";
+}
+// CompanyMasterProvider: 東証の全上場銘柄(約4,000社)の一覧。SAMPLE_COMPANIESが持つ10社分の
+// 詳細プロフィール(PER/PBR/関連企業など)は含まないが、社名・証券コード・市場区分・業種は
+// どの銘柄についても実データで表示できる(spec: 「株の購入ができる企業を全て見れるようにしたい」)。
+const CompanyMasterProvider = {
+  DATA_URL: "./data/companies.json",
+  CACHE_TTL_MILLIS: 30 * 60 * 1000,
+  _cache: null,
+  _cacheAtMs: 0,
+  _pending: null,
+  _byCode: null,
+  async loadData() {
+    const now = Date.now();
+    if (this._cache && (now - this._cacheAtMs) < this.CACHE_TTL_MILLIS) return this._cache;
+    if (this._pending) return this._pending;
+    this._pending = (async () => {
+      try {
+        const res = await fetch(this.DATA_URL, { cache: "no-store" });
+        if (!res.ok) throw new Error(`companies.json returned HTTP ${res.status}`);
+        const body = await res.json();
+        this._cache = body;
+        this._cacheAtMs = Date.now();
+        this._byCode = new Map((body.companies || []).map(c => [c.code, c]));
+        return body;
+      } finally {
+        this._pending = null;
+      }
+    })();
+    return this._pending;
+  },
+  async search(query, limit) {
+    await this.loadData().catch(() => null);
+    if (!this._byCode) return [];
+    const q = query.trim();
+    if (!q) return [];
+    const qLower = q.toLowerCase();
+    const out = [];
+    for (const c of this._byCode.values()) {
+      if (c.name.includes(q) || c.code.includes(q) || (c.nameEn && c.nameEn.toLowerCase().includes(qLower))) {
+        out.push(this.toCompanyShape(c));
+        if (out.length >= limit) break;
+      }
+    }
+    return out;
+  },
+  async getByCode(code) {
+    await this.loadData().catch(() => null);
+    return this._byCode ? (this._byCode.get(code) || null) : null;
+  },
+  toCompanyShape(m) {
+    return {
+      companyId: m.code, companyName: m.name, officialName: m.name, corporateNumber: null,
+      stockCode: m.code, exchange: mapMarketToExchangeKey(m.market), website: null, irUrl: null,
+      industry: m.sector33 || "-", marketCapBillionYen: null, per: null, pbr: null, roe: null,
+      revenueBillionYen: null, operatingIncomeBillionYen: null, fiveYearGrowthScore: null,
+      isFullProfile: false
+    };
+  }
+};
+// 監視企業タブ・検索結果など、SAMPLE_COMPANIES(詳細プロフィールあり)にもCompanyMasterProvider
+// (全銘柄・簡易プロフィール)にも一致しなかった場合でも、画面を壊さないための最終フォールバック。
+async function resolveCompanyLite(companyId) {
+  const full = companyById(companyId);
+  if (full) return full;
+  const master = await CompanyMasterProvider.getByCode(companyId);
+  if (master) return CompanyMasterProvider.toCompanyShape(master);
+  return {
+    companyId, companyName: companyId, officialName: companyId, corporateNumber: null,
+    stockCode: companyId, exchange: "UNKNOWN", website: null, irUrl: null, industry: "-",
+    marketCapBillionYen: null, per: null, pbr: null, roe: null,
+    revenueBillionYen: null, operatingIncomeBillionYen: null, fiveYearGrowthScore: null,
+    isFullProfile: false
+  };
+}
+
 const MarketRepository = {
   async getQuote(companyId) {
-    const apiKey = Storage.getSettings().jquantsApiKey;
-    if (apiKey) {
-      try { return await JQuantsProvider.getQuote(companyId, apiKey); }
-      catch (e) { /* 実データ取得に失敗 → サンプルデータへ自動フォールバック(スペック方針) */ }
-    }
+    const snapshot = await QuoteSnapshotProvider.getQuote(companyId).catch(() => null);
+    if (snapshot) return snapshot;
     return MockMarketDataProvider.getQuote(companyId);
   },
   async getHistory(companyId, rangeKey) {
-    const apiKey = Storage.getSettings().jquantsApiKey;
-    if (apiKey) {
-      try {
-        const points = await JQuantsProvider.getHistory(companyId, rangeKey, apiKey);
-        if (points.length >= 2) return points;
-      } catch (e) { /* フォールバック */ }
-    }
+    // 日次スナップショットは「1日分」の四本値のみで、任意企業の期間チャートまでは持たない
+    // (全銘柄分を日数分さかのぼって取得するとレート制限・実行時間の面で現実的でないため)。
+    // 正直に「サンプルデータ」であることを示すため、実データへの自動フォールバックはしない。
     return MockMarketDataProvider.getHistory(companyId, rangeKey);
   },
   computeScores(company, quote) {
@@ -643,7 +736,9 @@ async function renderHome(token) {
       MarketRepository.getTrendingCompanies().then(list => list.sort((a, b) => b.scores.totalScore - a.scores.totalScore).slice(0, 6))
     ]);
     if (token !== currentAbortToken) return;
-    const watchlist = Storage.getWatchlist().map(w => companyById(w.companyId)).filter(Boolean).slice(0, 5);
+    // companyById()だけだと監視対象10社以外(companies.jsonの全銘柄)が一覧から消えてしまうため、
+    // resolveCompanyLite()で簡易プロフィールにフォールバックする。
+    const watchlist = await Promise.all(Storage.getWatchlist().slice(0, 5).map(w => resolveCompanyLite(w.companyId)));
     const newsFailed = news === null;
 
     const newsAt = TdnetProvider.fetchedAtEpochMillis();
@@ -688,8 +783,9 @@ async function renderWatchlist(token) {
   }
   screenEl.innerHTML = loadingHtml();
   const rows = await Promise.all(entries.map(async entry => {
-    const company = companyById(entry.companyId);
-    if (!company) return null;
+    // companyById()だけだと監視対象10社以外(companies.jsonの全銘柄)が一覧から消えてしまうため、
+    // resolveCompanyLite()で簡易プロフィールにフォールバックする。
+    const company = await resolveCompanyLite(entry.companyId);
     const quote = await MarketRepository.getQuote(company.companyId).then(withChange).catch(() => null);
     let latestNewsTitle = null, newsUnavailable = false, hasNew = false;
     try {
@@ -728,14 +824,17 @@ async function renderSearch() {
     resultsEl.innerHTML = loadingHtml();
     const results = await CompanyProvider.searchCompanies(query);
     if (input.value !== query) return; // 入力が変わっていたら破棄
+    // companyById()は監視対象10社にしか使えないため、検索結果自体(companies.json全銘柄も含む)を
+    // 保持しておき、クリック時はそこから引く。
+    const resultsById = new Map(results.map(c => [c.companyId, c]));
     resultsEl.innerHTML = results.length === 0
       ? `<div class="empty-state">該当する企業が見つかりませんでした。</div>`
       : results.map(c => `<div class="card" data-pick="${c.companyId}">
           <div class="card-title">${escapeHtml(c.companyName)}</div>
-          <div class="card-sub">${escapeHtml(c.officialName)} ・ ${escapeHtml(c.stockCode || "コード不明")}</div>
+          <div class="card-sub">${escapeHtml(c.officialName)} ・ ${escapeHtml(c.stockCode || "コード不明")}${c.isFullProfile === false ? " ・ 簡易プロフィール" : ""}</div>
         </div>`).join("");
     resultsEl.querySelectorAll("[data-pick]").forEach(el => {
-      el.addEventListener("click", () => showConfirmation(companyById(el.dataset.pick)));
+      el.addEventListener("click", () => showConfirmation(resultsById.get(el.dataset.pick)));
     });
   };
   input.addEventListener("input", () => {
@@ -800,20 +899,22 @@ async function renderCompanyDetail(companyId, token) {
   renderCompanyDetailBody(company, quote, history_, news, relations);
 }
 async function renderUntrackedCompanyDetail(companyId, token) {
-  const [quote, data] = await Promise.all([
+  const [quote, data, master] = await Promise.all([
     MarketRepository.getQuote(companyId).then(withChange).catch(() => null),
-    TdnetProvider.loadData().catch(() => null)
+    TdnetProvider.loadData().catch(() => null),
+    CompanyMasterProvider.getByCode(companyId).catch(() => null)
   ]);
   if (token !== currentAbortToken) return;
-  // Recover the company name and any mentions of it from the already-loaded "recent" feed
-  // (this is how the user found their way here in the first place - a tap from a news card).
+  // Recover the company name from the全銘柄マスタ(companies.json)があればそちらを優先し、
+  // 無ければ「recent」ニュースフィードから拾う(ニュースカードのタップ経由で来た場合の保険)。
   const fromRecent = data ? (data.recent || [])
     .map(entry => TdnetProvider.toNewsItem(entry && entry.Tdnet, null))
     .filter(n => n && n.companyId === companyId) : [];
   const news = NewsRepository.deduplicate(fromRecent)
     .sort((a, b) => b.source.publishedAtEpochMillis - a.source.publishedAtEpochMillis);
-  const companyName = news[0]?.companyName || companyId;
+  const companyName = master?.name || news[0]?.companyName || companyId;
   topbarTitle.textContent = companyName;
+  const isWatched = Storage.isWatched(companyId);
 
   const html = `<div class="quote-row">
       ${quote ? `<div><div class="quote-price">¥${formatYen(quote.price)}</div>${freshnessHtml(quote.asOfEpochMillis, quote.isStale)}</div>${changeBadgeHtml(quote.change, quote.changePercent)}`
@@ -822,13 +923,21 @@ async function renderUntrackedCompanyDetail(companyId, token) {
     <div class="card">
       <div class="card-title" style="margin-bottom:8px">${escapeHtml(companyName)}</div>
       <div class="info-row"><span class="label">証券コード</span><span class="value">${escapeHtml(companyId)}</span></div>
-      <div class="empty-state" style="padding:10px 0 0;text-align:left">この企業は監視対象リスト(10社)に含まれていないため、詳細な財務情報(PER・PBR等)や関連企業は表示できません。ニュース原文は下のリンクからご確認いただけます。</div>
+      ${master ? `<div class="info-row"><span class="label">市場</span><span class="value">${escapeHtml(master.market || "-")}</span></div>
+      <div class="info-row"><span class="label">業種</span><span class="value">${escapeHtml(master.sector33 || "-")}</span></div>` : ""}
+      <div class="empty-state" style="padding:10px 0 0;text-align:left">この企業は監視対象10社(詳細プロフィールあり)には含まれていないため、財務情報(PER・PBR等)や関連企業は表示できません。株価・ニュースはご覧いただけます。</div>
     </div>
+    <button class="btn-outline" id="watchToggleBtnLite" style="margin:12px 16px">${isWatched ? "★ 監視中(タップで解除)" : "☆ この企業を監視する"}</button>
     <div class="section-header"><h2>ニュース</h2></div>
     ${news.length === 0 ? `<div class="empty-state">この企業のニュースが見つかりませんでした。</div>` : news.map(newsItemHtml).join("")}
     ${disclaimerHtml()}`;
   screenEl.innerHTML = html;
   bindNav(screenEl);
+  document.getElementById("watchToggleBtnLite").addEventListener("click", () => {
+    if (Storage.isWatched(companyId)) { Storage.removeFromWatchlist(companyId); showToast("監視を解除しました"); }
+    else { Storage.addToWatchlist(companyId); showToast("監視リストに追加しました"); }
+    renderUntrackedCompanyDetail(companyId, token);
+  });
 }
 function renderCompanyDetailBody(company, quote, history_, news, relations) {
   const isWatched = Storage.isWatched(company.companyId);
@@ -985,8 +1094,19 @@ function renderNewsBody(allNews) {
 }
 
 // ---------------- 設定 ----------------
-function renderSettings() {
+async function renderSettings(token) {
   const s = Storage.getSettings();
+  // 株価・企業マスタはもう「自分のブラウザに登録したキー」では動かない(CORSで常にブロックされる
+  // ことが確認済みのため)。サイト側がGitHub Actionsで毎日取得する共有データの状態を、正直にここに
+  // 表示する(取得前や未設定の間は「未取得」であることが分かるようにする)。
+  const [companiesData, quotesData] = await Promise.all([
+    CompanyMasterProvider.loadData().catch(() => null),
+    QuoteSnapshotProvider.loadData().catch(() => null)
+  ]);
+  if (token !== undefined && token !== currentAbortToken) return;
+  const companiesCount = companiesData?.companies?.length ?? null;
+  const quotesAsOfDate = quotesData?.asOfDate ?? null;
+
   screenEl.innerHTML = `
     <div class="settings-section">
       <h3>通知</h3>
@@ -996,18 +1116,24 @@ function renderSettings() {
       <p style="font-size:11.5px;color:var(--on-surface-variant);margin:0 0 8px">Web版はブラウザのプッシュ通知に対応していないため、この設定は今後の拡張用です。</p>
     </div>
     <div class="settings-section">
-      <h3>API連携(自分のアカウントを登録)</h3>
-      <p style="font-size:12px;color:var(--on-surface-variant);margin:0 0 8px;line-height:1.6">株価・企業情報をより正確に取得するために、無料の外部サービスに自分自身のアカウント(APIキー)を登録できます。未登録でもアプリは動作しますが、サンプルデータが表示されます。登録したキーはこの端末のブラウザの中だけに保存され、開発者を含む他の誰にも送信されません。</p>
-      <div class="api-field" id="jquantsField">
-        <div class="field-title">株価データ: J-Quants APIキー</div>
-        <div class="field-desc">JPXが提供する無料サービス「J-Quants」で取得したAPIキーを入力してください。登録先: jpx-jquants.com</div>
-        <div class="field-status ${s.jquantsApiKey ? "registered" : "unset"}">状態: ${s.jquantsApiKey ? "登録済み" : "未登録(サンプルデータを表示中)"}</div>
-        <div class="api-input-row"><input type="password" id="jquantsInput" placeholder="キーを貼り付け" value="${escapeHtml(s.jquantsApiKey || "")}"><button data-save="jquantsApiKey" data-input="jquantsInput">保存</button></div>
+      <h3>株価・上場銘柄データ</h3>
+      <p style="font-size:12px;color:var(--on-surface-variant);margin:0 0 8px;line-height:1.6">株価データを提供するJ-Quants APIはブラウザから直接呼び出すとブロックされる(CORS)ため、個人でAPIキーを登録する方式は廃止しました。代わりに、サイトを管理している開発者側のキーでGitHub Actionsが毎日データを取得し、利用者全員に同じ内容を表示しています。無料プランの制約上、株価は「取得できた直近の営業日」時点のもので、常に約3か月前後遅れた参考値です(発注価格として使わないでください)。</p>
+      <div class="api-field">
+        <div class="field-title">対応している上場銘柄数</div>
+        <div class="field-status ${companiesCount ? "registered" : "unset"}">${companiesCount ? `${companiesCount}社(東証上場銘柄)を検索できます` : "未取得(監視対象10社のサンプルのみ表示中)"}</div>
       </div>
+      <div class="api-field">
+        <div class="field-title">株価データの基準日</div>
+        <div class="field-status ${quotesAsOfDate ? "registered" : "unset"}">${quotesAsOfDate ? `${quotesAsOfDate} 時点のデータ` : "未取得(サンプル価格を表示中)"}</div>
+      </div>
+    </div>
+    <div class="settings-section">
+      <h3>法人番号検索(任意・現在は動作しません)</h3>
+      <p style="font-size:12px;color:var(--on-surface-variant);margin:0 0 8px;line-height:1.6">国税庁「法人番号システムWeb-API」も同じくブラウザからの直接呼び出しがブロックされるため、下にアプリケーションIDを登録しても実際には使われず、常にサンプルの候補が表示されます。株価・企業データと同様の仕組みに移行するかは今後検討します。</p>
       <div class="api-field" id="houjinField">
-        <div class="field-title">法人番号検索: 国税庁 アプリケーションID</div>
-        <div class="field-desc">国税庁「法人番号システムWeb-API」のアプリケーションIDを入力してください。登録方法: invoice-web-api@nta.go.jp 宛にメールで申請(無料)。</div>
-        <div class="field-status ${s.houjinBangouAppId ? "registered" : "unset"}">状態: ${s.houjinBangouAppId ? "登録済み" : "未登録(サンプルデータを表示中)"}</div>
+        <div class="field-title">国税庁 アプリケーションID</div>
+        <div class="field-desc">登録方法: invoice-web-api@nta.go.jp 宛にメールで申請(無料)。</div>
+        <div class="field-status ${s.houjinBangouAppId ? "registered" : "unset"}">状態: ${s.houjinBangouAppId ? "登録済み(ただし未使用)" : "未登録"}</div>
         <div class="api-input-row"><input type="password" id="houjinInput" placeholder="IDを貼り付け" value="${escapeHtml(s.houjinBangouAppId || "")}"><button data-save="houjinBangouAppId" data-input="houjinInput">保存</button></div>
       </div>
     </div>
@@ -1016,7 +1142,7 @@ function renderSettings() {
       <div class="about-block">
         投資情報モニター Web版(Phase 1)<br>
         本アプリは投資助言サービスではありません。表示される情報は投資情報の収集・整理・分析を支援するものであり、投資判断は必ずご自身の責任で行ってください。<br><br>
-        このWeb版はブラウザ内だけで動作し、監視企業やAPIキーの登録内容はこの端末のブラウザにのみ保存されます(他の端末やAndroid版とは同期されません)。iPhoneでは、Safariの共有ボタン→「ホーム画面に追加」でアプリのように使えます。
+        このWeb版はブラウザ内だけで動作し、監視企業の登録内容はこの端末のブラウザにのみ保存されます(他の端末やAndroid版とは同期されません)。iPhoneでは、Safariの共有ボタン→「ホーム画面に追加」でアプリのように使えます。
       </div>
     </div>`;
 
@@ -1027,7 +1153,7 @@ function renderSettings() {
       const input = document.getElementById(btn.dataset.input);
       Storage.setSetting(key, input.value.trim() || null);
       showToast("保存しました");
-      renderSettings();
+      renderSettings(token);
     });
   });
 }
