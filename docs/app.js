@@ -278,6 +278,20 @@ const QuoteSnapshotProvider = {
       dayHigh: q.high, dayLow: q.low, volume: q.volume,
       asOfEpochMillis: asOf, isStale: (Date.now() - asOf) > this.STALE_THRESHOLD_MILLIS
     };
+  },
+  // 「注目企業」を監視対象10社だけでなく実データのある全銘柄から拾えるようにするための一括アクセス。
+  async getAllQuotes() {
+    const data = await this.loadData().catch(() => null);
+    const quotes = data && data.quotes ? data.quotes : {};
+    const asOfEpochMillis = data && data.asOfDate ? Date.parse(`${data.asOfDate}T15:00:00+09:00`) : NaN;
+    const asOf = Number.isNaN(asOfEpochMillis) ? Date.now() : asOfEpochMillis;
+    const isStale = (Date.now() - asOf) > this.STALE_THRESHOLD_MILLIS;
+    return Object.keys(quotes).map(companyId => {
+      const q = quotes[companyId];
+      if (q.close == null) return null;
+      const previousClose = q.prevClose != null ? q.prevClose : q.close;
+      return { companyId, price: q.close, previousClose, open: q.open, dayHigh: q.high, dayLow: q.low, volume: q.volume, asOfEpochMillis: asOf, isStale };
+    }).filter(Boolean);
   }
 };
 
@@ -374,12 +388,16 @@ const MarketRepository = {
     // 正直に「サンプルデータ」であることを示すため、実データへの自動フォールバックはしない。
     return MockMarketDataProvider.getHistory(companyId, rangeKey);
   },
-  computeScores(company, quote) {
+  // newsCount: そのcompanyIdがニュース「recent」フィード(直近取得分)に何件登場したか(実データ)。
+  // 監視対象10社以外(PER・5年成長スコアなどの財務データを持たない)ではgrowth/valuationは中立値に
+  // なるため、totalScoreは「動き(値動き・出来高・話題性)」寄りの参考値になる - 財務指標を捏造しない
+  // ための意図的な設計。
+  computeScores(company, quote, newsCount) {
     const momentum = clamp(((quote.changePercent + 5) / 10) * 100, 0, 100) | 0;
-    const growth = clamp(company.fiveYearGrowthScore, 0, 100);
+    const growth = clamp(company.fiveYearGrowthScore ?? 0, 0, 100);
     const per = company.per;
     const valuation = per == null ? 50 : per <= 0 ? 20 : per < 10 ? 85 : per < 20 ? 65 : per < 35 ? 45 : 25;
-    const news = clamp(30 + Math.abs(hashString(company.companyId) % 50), 0, 100);
+    const news = clamp((newsCount || 0) * 35, 0, 100);
     const volumeScore = clamp((quote.volume / 20000000) * 100, 0, 100) | 0;
     const longTerm = clamp(growth * 0.6 + valuation * 0.4, 0, 100) | 0;
     const totalScore = clamp((momentum + growth + valuation + news + volumeScore + longTerm) / 6, 0, 100) | 0;
@@ -396,14 +414,50 @@ const MarketRepository = {
     if (cats.length === 0 && Math.abs(quote.changePercent) < 2.0 && scores.longTermScore >= 55) cats.push("LONG_TERM_WATCH");
     return cats;
   },
-  async getTrendingCompanies() {
-    // 10社分をまとめて並行取得(直列だと1社ずつ待つ分だけ遅くなるため)
+  // ニュース「recent」フィード(直近取得分、実データ)の中で、companyIdごとに何件登場したかを集計する。
+  async newsCountsByCompany() {
+    const data = await TdnetProvider.loadData().catch(() => null);
+    const counts = {};
+    if (data) {
+      for (const entry of (data.recent || [])) {
+        const item = TdnetProvider.toNewsItem(entry && entry.Tdnet, null);
+        if (item) counts[item.companyId] = (counts[item.companyId] || 0) + 1;
+      }
+    }
+    return counts;
+  },
+  // 監視対象10社だけを対象にした従来のスコアリング(全銘柄の株価スナップショットがまだ無い間の
+  // フォールバック - ワークフロー未実行や、GitHub SecretのAPIキー未設定の状態でも動作を確認できる
+  // ようにするため)。
+  async getTrendingCompaniesFromSample() {
+    const newsCounts = await this.newsCountsByCompany();
     return Promise.all(SAMPLE_COMPANIES.map(async company => {
       const quote = withChange(await this.getQuote(company.companyId));
-      const scores = this.computeScores(company, quote);
+      const newsCount = newsCounts[company.companyId] || 0;
+      const scores = this.computeScores(company, quote, newsCount);
       const categories = this.categorizeTrend(company, quote, scores);
-      return { company, quote, scores, categories, newsCount24h: randInt(mulberry32(hashString(company.companyId + "n")), 0, 6) };
+      return { company, quote, scores, categories, newsCount24h: newsCount };
     }));
+  },
+  async getTrendingCompanies() {
+    // 監視対象10社だけを対象にすると、実データでは1日の値動きが±2%を超える銘柄が少なく、
+    // 「該当する企業がありません」ばかりになってしまう(ご指摘の通り)。実データのある全銘柄
+    // (quotes.json)から急騰・急落・出来高急増・話題性のある企業を拾うことで、大企業10社に
+    // 限らない、実際に動きのある企業が表示されるようにした。
+    const allQuotes = await QuoteSnapshotProvider.getAllQuotes();
+    if (allQuotes.length === 0) return this.getTrendingCompaniesFromSample();
+    const newsCounts = await this.newsCountsByCompany();
+    const results = await Promise.all(allQuotes.map(async q => {
+      const company = await resolveCompanyLite(q.companyId);
+      const quote = withChange(q);
+      const newsCount = newsCounts[q.companyId] || 0;
+      const scores = this.computeScores(company, quote, newsCount);
+      const categories = this.categorizeTrend(company, quote, scores);
+      return { company, quote, scores, categories, newsCount24h: newsCount };
+    }));
+    // IPOサンプル企業(実データを持たない架空の企業)は別枠(getIpoCompanies)で扱うため、
+    // 全銘柄集計にはそもそも含まれない。カテゴリに一つも該当しない銘柄は「注目」ではないので除外する。
+    return results.filter(r => r.categories.length > 0);
   },
   async getIpoCompanies() {
     const ipo = companyById("IPO001");
