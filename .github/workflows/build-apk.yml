@@ -42,11 +42,11 @@ jobs:
 
       - name: Run unit tests
         id: unit_tests
-        run: ./gradlew test --stacktrace 2>&1 | tee build_test.log
+        run: set -o pipefail; ./gradlew test --stacktrace 2>&1 | tee build_test.log
 
       - name: Build debug APK
         id: build_debug
-        run: ./gradlew assembleDebug --stacktrace 2>&1 | tee build_debug.log
+        run: set -o pipefail; ./gradlew assembleDebug --stacktrace 2>&1 | tee build_debug.log
 
       # The keystore itself is never committed to the repo - it only ever exists as a base64
       # secret (RELEASE_KEYSTORE_BASE64) that gets decoded back into a real .jks file here, in
@@ -63,11 +63,19 @@ jobs:
 
       - name: Build release APK (unsigned unless signing secrets are configured)
         id: build_release
-        run: ./gradlew assembleRelease --stacktrace 2>&1 | tee build_release.log
+        run: set -o pipefail; ./gradlew assembleRelease --stacktrace 2>&1 | tee build_release.log
         env:
           RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+
+      # Pure visibility - shows up directly in this step's log regardless of what happened above,
+      # without needing to dig through the full Gradle output.
+      - name: Show release APK output directory
+        if: always()
+        run: |
+          echo "RELEASE_STORE_FILE was set: $([ -n "$RELEASE_STORE_FILE" ] && echo yes || echo no)"
+          ls -la app/build/outputs/apk/release/ 2>&1 || echo "(release output directory does not exist - the build did not get this far)"
 
       - name: Upload debug APK artifact
         if: always()
@@ -128,6 +136,14 @@ jobs:
             echo "## Last log lines (release build)"
             echo '```'
             tail -n 80 build_release.log 2>/dev/null
+            echo '```'
+            echo ""
+            # Gradle's actual "what went wrong" summary can be well before the last 80 lines when
+            # --stacktrace prints a long exception first - grab from that summary onward instead
+            # of just the raw tail, so the real error message is never lost off the end.
+            echo "## Release build failure summary (if any)"
+            echo '```'
+            awk '/FAILURE: Build failed|^\* What went wrong:/{found=1} found' build_release.log 2>/dev/null | head -n 100
             echo '```'
           } > /tmp/ci-status/last-build.md
 
